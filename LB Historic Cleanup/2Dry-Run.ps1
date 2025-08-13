@@ -27,6 +27,14 @@ REQUIRES:
   Az.Accounts, Az.OperationalInsights, Az.SecurityInsights
 #>
 
+<#
+Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag, and log to CSV + TXT.
+- Works on Windows PowerShell 5.1 and PowerShell 7+
+- Defaults outputs to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv and .txt
+- Server-side OData filter; supports -WhatIf for dry runs
+- Robust property handling across Az.SecurityInsights versions
+#>
+
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
   [Parameter(Mandatory)][string]$ResourceGroup,
@@ -46,16 +54,20 @@ param(
 )
 
 # -------- Defaults & validation --------
-# Default CSV path if not provided (C:\Temp)
+# Default CSV path if not provided (C:\)
 if (-not $CsvPath -or [string]::IsNullOrWhiteSpace($CsvPath)) {
   $CsvPath = Join-Path -Path 'C:\Temp\' -ChildPath ("sentinel-close-log_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
 
-# Ensure CSV folder exists
+# Derive TXT path (same base name)
+$TxtPath = [System.IO.Path]::ChangeExtension($CsvPath, '.txt')
+
+# Ensure output folder exists
 $csvDir = Split-Path -Path $CsvPath -Parent
 if (-not $csvDir -or [string]::IsNullOrWhiteSpace($csvDir)) {
   $csvDir = (Get-Location).Path
   $CsvPath = Join-Path -Path $csvDir -ChildPath (Split-Path -Path $CsvPath -Leaf)
+  $TxtPath = [System.IO.Path]::ChangeExtension($CsvPath, '.txt')
 }
 if (-not (Test-Path $csvDir)) {
   New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
@@ -70,7 +82,7 @@ try {
 }
 if ($toDt -le $fromDt) { throw "Parameter -To must be greater than -From." }
 
-# -------- Helper to read props across module versions (no Invoke-Expression) --------
+# -------- Helpers --------
 function Get-Prop {
   param($obj, [string[]]$paths)
   foreach ($p in $paths) {
@@ -89,6 +101,60 @@ function Get-Prop {
   return $null
 }
 
+# Define the output schema once so we can write header-only CSVs
+$CsvColumns = @(
+  'TimestampUTC','IncidentId','IncidentName','IncidentNumber','Title',
+  'CreatedTimeUtc','LastModifiedTimeUtc','LastActivityTimeUtc','Severity','Owner',
+  'Result','StatusBefore','StatusAfter','Classification','LabelsBefore','LabelsAfter','CommentSnippet','Error'
+)
+
+function Write-CsvSafe {
+  param([array]$Rows, [string]$Path, [string[]]$Columns)
+  try {
+    if ($Rows -and $Rows.Count -gt 0) {
+      $Rows | Select-Object $Columns | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+    } else {
+      # Write header-only CSV so a file always exists
+      ($Columns -join ',') | Set-Content -Path $Path -Encoding UTF8
+    }
+    Write-Host ("Audit CSV written to {0}" -f $Path)
+  } catch {
+    Write-Warning ("Failed to write CSV to {0}: {1}" -f $Path, $_.Exception.Message)
+  }
+}
+
+function Write-TxtLog {
+  param([array]$Rows, [string]$Path, [string]$FilterText)
+  try {
+    $nowUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $lines = @()
+    $lines += "Microsoft Sentinel Incident Closure Run"
+    $lines += "RunTimestampUTC : $nowUtc"
+    $lines += "ResourceGroup   : $ResourceGroup"
+    $lines += "Workspace       : $Workspace"
+    $lines += "From            : $($fromDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+    $lines += "To              : $($toDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+    $lines += "Classification  : $Classification"
+    $lines += "Tag             : $Tag"
+    $lines += "Filter          : $FilterText"
+    $lines += "MatchedCount    : $($Rows.Count)"
+    $lines += ("-"*80)
+
+    foreach ($r in $Rows) {
+      $lines += ("Id={0} | Name={1} | Title={2} | Sev={3} | CreatedUtc={4} | Result={5}" -f `
+        $r.IncidentId, $r.IncidentName, $r.Title, $r.Severity, $r.CreatedTimeUtc, $r.Result)
+      if ($r.Error) { $lines += ("  Error: {0}" -f $r.Error) }
+    }
+    $lines += ("-"*80)
+    $lines += "End of run."
+
+    Set-Content -Path $Path -Value $lines -Encoding UTF8
+    Write-Host ("Text log written to {0}" -f $Path)
+  } catch {
+    Write-Warning ("Failed to write TXT log to {0}: {1}" -f $Path, $_.Exception.Message)
+  }
+}
+
 # -------- Query & update --------
 $filter = "properties/createdTimeUtc ge $($fromDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) and properties/createdTimeUtc lt $($toDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) and properties/status ne 'Closed'"
 Write-Verbose ("OData filter: {0}" -f $filter)
@@ -97,17 +163,16 @@ $results   = @()
 $incidents = Get-AzSentinelIncident -ResourceGroupName $ResourceGroup -WorkspaceName $Workspace -Filter $filter
 
 if (-not $incidents) {
-  Write-Warning "No incidents matched the filter. Nothing to do."
+  Write-Warning "No incidents matched the filter. Continuing to write empty CSV/TXT logs."
 }
 
 foreach ($incident in $incidents) {
-  # Handle flattened vs nested shapes
   $p = $incident.Properties
   if (-not $p) { $p = $incident }
 
   $id               = Get-Prop $incident @('Name','Id')
   $title            = Get-Prop $p       @('Title','title')
-  $incidentName     = Get-Prop $p       @('IncidentName','incidentName','Name','name')
+ # $incidentName     = Get-Prop $p       @('IncidentName','incidentName','Name','name')
   $incidentNumber   = Get-Prop $p       @('IncidentNumber','incidentNumber')
   $createdTimeUtc   = Get-Prop $p       @('CreatedTimeUtc','createdTimeUtc','CreatedTime','createdTime')
   $lastModifiedUtc  = Get-Prop $p       @('LastModifiedTimeUtc','lastModifiedTimeUtc')
@@ -117,7 +182,7 @@ foreach ($incident in $incidents) {
   $labelsBeforeRaw  = Get-Prop $p       @('Labels','labels')
   $ownerObj         = Get-Prop $p       @('Owner','owner')
 
-  # Owner normalisation (try common shapes)
+  # Owner normalisation
   $owner = $null
   if ($ownerObj) {
     $owner = Get-Prop $ownerObj @('AssignedTo','UserPrincipalName','Email','EmailAddress','Name')
@@ -151,13 +216,13 @@ foreach ($incident in $incidents) {
     LastActivityTimeUtc  = $lastActivityTimeUtc
     Severity             = $severity
     Owner                = $owner
+    Result               = "PENDING"
     StatusBefore         = $statusBefore
     StatusAfter          = "Closed"
     Classification       = $Classification
     LabelsBefore         = ($labelsBefore -join ";")
     LabelsAfter          = ($labelsAfter  -join ";")
     CommentSnippet       = ($finalComment.Substring(0, [Math]::Min(120, $finalComment.Length)))
-    Result               = "PENDING"
     Error                = $null
   }
 
@@ -172,7 +237,7 @@ foreach ($incident in $incidents) {
         -Labels $labelsAfter | Out-Null
 
       $log.Result = "UPDATED"
-      Start-Sleep -Milliseconds 200  # gentle pacing
+      Start-Sleep -Milliseconds 200
     } else {
       $log.Result = "WHATIF"
     }
@@ -185,13 +250,9 @@ foreach ($incident in $incidents) {
   }
 }
 
-# -------- Persist CSV & render table --------
-try {
-  $results | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-  Write-Host ("Audit log written to {0}" -f $CsvPath)
-} catch {
-  Write-Warning ("Failed to write CSV to {0}: {1}" -f $CsvPath, $_.Exception.Message)
-}
+# -------- Persist CSV + TXT & render table --------
+Write-CsvSafe -Rows $results -Path $CsvPath -Columns $CsvColumns
+Write-TxtLog  -Rows $results -Path $TxtPath -FilterText $filter
 
 $results |
   Select-Object TimestampUTC, IncidentId, IncidentName, IncidentNumber, Title, CreatedTimeUtc, LastModifiedTimeUtc, LastActivityTimeUtc, Severity, Owner, Result, StatusBefore, StatusAfter, Classification |
