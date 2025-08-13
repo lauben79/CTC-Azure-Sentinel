@@ -133,10 +133,11 @@ foreach ($incident in $incidents) {
 # Always try to write CSV, even if $results is empty
 try {
   $results | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-  Write-Host "Audit log written to $CsvPath"
+  Write-Host ("Audit log written to {0}" -f $CsvPath)
 } catch {
-  Write-Warning "Failed to write CSV to $CsvPath: $($_.Exception.Message)"
+  Write-Warning ("Failed to write CSV to {0}: {1}" -f $CsvPath, $_.Exception.Message)
 }
+
 
 # Console table
 $results |
