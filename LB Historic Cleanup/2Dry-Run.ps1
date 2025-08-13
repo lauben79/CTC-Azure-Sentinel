@@ -53,7 +53,12 @@ foreach ($incident in $incidents) {
   $lastModifiedUtc   = $incident.Properties.LastModifiedTimeUtc
   $lastActivityUtc   = $incident.Properties.LastActivityTimeUtc
   $severity          = $incident.Properties.Severity
-  $owner             = $incident.Properties.Owner?.AssignedTo
+  
+  if ($incident.Properties.Owner) {
+    $owner = $incident.Properties.Owner.AssignedTo
+} else {
+    $owner = $null
+}
 
   $labelsAfter       = ($labelsBefore + $Tag | Select-Object -Unique)
 
