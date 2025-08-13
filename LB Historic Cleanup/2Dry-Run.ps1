@@ -10,28 +10,11 @@ Close Microsoft Sentinel incidents in a date window, classify as Undetermined, a
 # Use -WhatIf to dry-run without making changes.
 #>
 
-# --- robust, PS5.1-compatible helpers ---
-<#
-Close Sentinel incidents in a date window, classify as Undetermined, add a tag, and log to CSV.
-Works on Windows PowerShell 5.1 and PowerShell 7+.
-#>
-
-<#
-Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag, and log to CSV.
-- Works on Windows PowerShell 5.1 and PowerShell 7+
-- Defaults CSV to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
-- Fields logged: Id, Name, Number, Title, Created/Modified/Activity times, Severity, Owner, Status (before/after), Labels, etc.
-- Uses server-side OData filter and supports -WhatIf for dry runs.
-
-REQUIRES:
-  Az.Accounts, Az.OperationalInsights, Az.SecurityInsights
-#>
-
 <#
 Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag,
 and write BOTH a CSV and a TXT (identical comma-separated data).
 
-- PowerShell 5.1 and 7+ compatible
+- PowerShell 5.1 and 7+ compatible (no null-conditional operators)
 - Defaults:
     ResourceGroup     = "RG-REPLACE"
     Workspace         = "WS-REPLACE"
@@ -49,8 +32,8 @@ REQUIRES: Az.Accounts, Az.OperationalInsights, Az.SecurityInsights
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
   # --- Defaults you can edit below ---
-  [string]$ResourceGroup   = "east-us-cybersecurity",
-  [string]$Workspace       = "global-cyber-security",
+  [string]$ResourceGroup   = "RG-REPLACE",
+  [string]$Workspace       = "WS-REPLACE",
 
   # ISO 8601 UTC
   [string]$From            = "2025-03-01T00:00:00Z",
@@ -230,10 +213,11 @@ foreach ($incident in $incidents) {
     Error                = $null
   }
 
-  # ---- Hardened update with ETag/IfMatch retry & throttling backoff ----
+  # ---- Hardened update with ETag/IfMatch retry & throttling backoff (no ?. operators) ----
   try {
     $target = "Incident '$title' ($id)"
     if ($PSCmdlet.ShouldProcess($target, "Close as $Classification, add tag '$Tag'")) {
+
       $baseArgs = @{
         ResourceGroupName     = $ResourceGroup
         WorkspaceName         = $Workspace
@@ -251,10 +235,18 @@ foreach ($incident in $incidents) {
         $log.Result = "UPDATED"
         $attempted = $true
       } catch {
-        $msg = $_.Exception.Message
-        $detail = $_.ErrorDetails?.Message
-        $http  = $_.Exception.Response?.StatusCode
-        $body  = $_.Exception.Response?.Content
+        # Safe error extraction for PS 5.1
+        $msg    = $_.Exception.Message
+        $detail = $null
+        $http   = $null
+        $body   = $null
+        if ($_.ErrorDetails) {
+          try { if ($_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message } } catch {}
+        }
+        if ($_.Exception -and $_.Exception.Response) {
+          try { $http = $_.Exception.Response.StatusCode } catch {}
+          try { $body = $_.Exception.Response.Content } catch {}
+        }
         $composed = @($msg, $detail, $http, $body) -join " | "
 
         if ($composed -match '412|Precondition|etag') {
@@ -266,8 +258,15 @@ foreach ($incident in $incidents) {
               $log.Result = "UPDATED(ETAG-*)"
               $attempted = $true
             } catch {
+              $emsg    = $_.Exception.Message
+              $edetail = $null; if ($_.ErrorDetails) { try { if ($_.ErrorDetails.Message) { $edetail = $_.ErrorDetails.Message } } catch {} }
+              $ehttp   = $null; $ebody = $null
+              if ($_.Exception -and $_.Exception.Response) {
+                try { $ehttp = $_.Exception.Response.StatusCode } catch {}
+                try { $ebody = $_.Exception.Response.Content } catch {}
+              }
               $log.Result = "FAILED"
-              $log.Error  = (@($_.Exception.Message, $_.ErrorDetails?.Message, $_.Exception.Response?.StatusCode, $_.Exception.Response?.Content) -join " | ")
+              $log.Error  = (@($emsg, $edetail, $ehttp, $ebody) -join " | ")
             }
           } else {
             $log.Result = "FAILED"
@@ -285,8 +284,15 @@ foreach ($incident in $incidents) {
             $log.Result = "UPDATED(RETRY)"
             $attempted = $true
           } catch {
+            $emsg2    = $_.Exception.Message
+            $edetail2 = $null; if ($_.ErrorDetails) { try { if ($_.ErrorDetails.Message) { $edetail2 = $_.ErrorDetails.Message } } catch {} }
+            $ehttp2   = $null; $ebody2 = $null
+            if ($_.Exception -and $_.Exception.Response) {
+              try { $ehttp2 = $_.Exception.Response.StatusCode } catch {}
+              try { $ebody2 = $_.Exception.Response.Content } catch {}
+            }
             $log.Result = "FAILED"
-            $log.Error  = (@($_.Exception.Message, $_.ErrorDetails?.Message, $_.Exception.Response?.StatusCode, $_.Exception.Response?.Content) -join " | ")
+            $log.Error  = (@($emsg2, $edetail2, $ehttp2, $ebody2) -join " | ")
           }
         }
         else {
@@ -302,8 +308,16 @@ foreach ($incident in $incidents) {
       $log.Result = "WHATIF"
     }
   } catch {
+    # Final catch with PS 5.1-safe extraction
+    $emsg3    = $_.Exception.Message
+    $edetail3 = $null; if ($_.ErrorDetails) { try { if ($_.ErrorDetails.Message) { $edetail3 = $_.ErrorDetails.Message } } catch {} }
+    $ehttp3   = $null; $ebody3 = $null
+    if ($_.Exception -and $_.Exception.Response) {
+      try { $ehttp3 = $_.Exception.Response.StatusCode } catch {}
+      try { $ebody3 = $_.Exception.Response.Content } catch {}
+    }
     $log.Result = "FAILED"
-    $log.Error  = (@($_.Exception.Message, $_.ErrorDetails?.Message, $_.Exception.Response?.StatusCode, $_.Exception.Response?.Content) -join " | ")
+    $log.Error  = (@($emsg3, $edetail3, $ehttp3, $ebody3) -join " | ")
     Write-Warning ("Failed to update {0} ({1}): {2}" -f $title, $id, $log.Error)
   } finally {
     $results += New-Object psobject -Property $log
