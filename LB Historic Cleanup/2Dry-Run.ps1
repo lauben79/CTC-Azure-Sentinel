@@ -49,8 +49,8 @@ REQUIRES: Az.Accounts, Az.OperationalInsights, Az.SecurityInsights
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
   # --- Defaults you can edit below ---
-  [string]$ResourceGroup   = "RG-REPLACE",
-  [string]$Workspace       = "WS-REPLACE",
+  [string]$ResourceGroup   = "east-us-cybersecurity",
+  [string]$Workspace       = "global-cyber-security",
 
   # ISO 8601 UTC
   [string]$From            = "2025-03-01T00:00:00Z",
