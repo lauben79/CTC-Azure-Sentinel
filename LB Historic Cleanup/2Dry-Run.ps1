@@ -11,27 +11,87 @@ Close Microsoft Sentinel incidents in a date window, classify as Undetermined, a
 #>
 
 # --- robust, PS5.1-compatible helpers ---
+<#
+Close Sentinel incidents in a date window, classify as Undetermined, add a tag, and log to CSV.
+Works on Windows PowerShell 5.1 and PowerShell 7+.
+#>
+
+<#
+Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag, and log to CSV.
+- Works on Windows PowerShell 5.1 and PowerShell 7+
+- Defaults CSV to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
+- Fields logged: Id, Name, Number, Title, Created/Modified/Activity times, Severity, Owner, Status (before/after), Labels, etc.
+- Uses server-side OData filter and supports -WhatIf for dry runs.
+
+REQUIRES:
+  Az.Accounts, Az.OperationalInsights, Az.SecurityInsights
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+  [Parameter(Mandatory)][string]$ResourceGroup,
+  [Parameter(Mandatory)][string]$Workspace,
+
+  # Use ISO 8601 UTC e.g. 2025-03-01T00:00:00Z
+  [Parameter(Mandatory)][string]$From,
+  [Parameter(Mandatory)][string]$To,
+
+  [string]$Classification = "Undetermined",
+  [Parameter(Mandatory)][string]$Tag,
+
+  [Parameter(Mandatory)][string]$BaseComment,
+
+  # Optional. If omitted, defaults to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
+  [string]$CsvPath
+)
+
+# -------- Defaults & validation --------
+# Default CSV path if not provided (C:\Temp)
+if (-not $CsvPath -or [string]::IsNullOrWhiteSpace($CsvPath)) {
+  $CsvPath = Join-Path -Path 'C:\Temp\' -ChildPath ("sentinel-close-log_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+}
+
+# Ensure CSV folder exists
+$csvDir = Split-Path -Path $CsvPath -Parent
+if (-not $csvDir -or [string]::IsNullOrWhiteSpace($csvDir)) {
+  $csvDir = (Get-Location).Path
+  $CsvPath = Join-Path -Path $csvDir -ChildPath (Split-Path -Path $CsvPath -Leaf)
+}
+if (-not (Test-Path $csvDir)) {
+  New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
+}
+
+# Parse dates
+try {
+  [datetime]$fromDt = [datetime]::Parse($From)
+  [datetime]$toDt   = [datetime]::Parse($To)
+} catch {
+  throw ("From/To must be valid timestamps (e.g. 2025-03-01T00:00:00Z). Error: {0}" -f $_.Exception.Message)
+}
+if ($toDt -le $fromDt) { throw "Parameter -To must be greater than -From." }
+
+# -------- Helper to read props across module versions (no Invoke-Expression) --------
 function Get-Prop {
   param($obj, [string[]]$paths)
   foreach ($p in $paths) {
-    try {
-      $v = $obj | ForEach-Object { Invoke-Expression ('$_.{0}' -f $p) }
-      if ($null -ne $v -and "$v" -ne "") { return $v }
-    } catch { }
+    $o = $obj
+    foreach ($seg in ($p -split '\.')) {
+      if ($null -eq $o) { break }
+      try {
+        $o = $o | Select-Object -ExpandProperty $seg -ErrorAction Stop
+      } catch {
+        $o = $null
+        break
+      }
+    }
+    if ($null -ne $o -and "$o" -ne "") { return $o }
   }
   return $null
 }
 
-# Ensure CSV folder exists (so Export-Csv never silently fails)
-$csvDir = Split-Path -Path $CsvPath -Parent
-if ($csvDir -and -not (Test-Path $csvDir)) {
-  New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
-}
-
-$ErrorActionPreference = 'Stop'
-
-$filter = "properties/createdTimeUtc ge $($fromDt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")) and properties/createdTimeUtc lt $($toDt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")) and properties/status ne 'Closed'"
-Write-Verbose "OData filter: $filter"
+# -------- Query & update --------
+$filter = "properties/createdTimeUtc ge $($fromDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) and properties/createdTimeUtc lt $($toDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) and properties/status ne 'Closed'"
+Write-Verbose ("OData filter: {0}" -f $filter)
 
 $results   = @()
 $incidents = Get-AzSentinelIncident -ResourceGroupName $ResourceGroup -WorkspaceName $Workspace -Filter $filter
@@ -41,10 +101,9 @@ if (-not $incidents) {
 }
 
 foreach ($incident in $incidents) {
-
-  # Try both flattened and nested shapes
+  # Handle flattened vs nested shapes
   $p = $incident.Properties
-  if (-not $p) { $p = $incident }  # fallback if module flattened fields
+  if (-not $p) { $p = $incident }
 
   $id               = Get-Prop $incident @('Name','Id')
   $title            = Get-Prop $p       @('Title','title')
@@ -57,31 +116,27 @@ foreach ($incident in $incidents) {
   $severity         = Get-Prop $p       @('Severity','severity')
   $labelsBeforeRaw  = Get-Prop $p       @('Labels','labels')
   $ownerObj         = Get-Prop $p       @('Owner','owner')
-  $owner            = $null
 
-  # Owner normalisation
+  # Owner normalisation (try common shapes)
+  $owner = $null
   if ($ownerObj) {
-    # Try common shapes: AssignedTo, UserPrincipalName, Email/EmailAddress
     $owner = Get-Prop $ownerObj @('AssignedTo','UserPrincipalName','Email','EmailAddress','Name')
   }
 
-  # Labels normalisation to array
+  # Labels → array of strings
   $labelsBefore = @()
   if ($labelsBeforeRaw -is [System.Collections.IEnumerable]) {
     foreach ($l in $labelsBeforeRaw) {
-      # Labels can be either strings or objects with Name/Value
       $labelName = Get-Prop $l @('Name','name')
       if ($labelName) { $labelsBefore += "$labelName" }
-      elseif ($l) { $labelsBefore += "$l" }
+      elseif ($l)     { $labelsBefore += "$l" }
     }
   } elseif ($labelsBeforeRaw) {
     $labelsBefore = @("$labelsBeforeRaw")
   }
-
-  # Merge labels with requested tag; de-dupe
   $labelsAfter = ($labelsBefore + $Tag | Where-Object { $_ } | Select-Object -Unique)
 
-  # Timestamped comment
+  # Comment with closure timestamp (UTC)
   $tsUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
   $finalComment = "$BaseComment (Closure timestamp: $tsUtc)"
 
@@ -93,7 +148,7 @@ foreach ($incident in $incidents) {
     Title                = $title
     CreatedTimeUtc       = $createdTimeUtc
     LastModifiedTimeUtc  = $lastModifiedUtc
-    LastActivityTimeUtc  = $lastActivityUtc
+    LastActivityTimeUtc  = $lastActivityTimeUtc
     Severity             = $severity
     Owner                = $owner
     StatusBefore         = $statusBefore
@@ -117,20 +172,20 @@ foreach ($incident in $incidents) {
         -Labels $labelsAfter | Out-Null
 
       $log.Result = "UPDATED"
-      Start-Sleep -Milliseconds 200
+      Start-Sleep -Milliseconds 200  # gentle pacing
     } else {
       $log.Result = "WHATIF"
     }
   } catch {
     $log.Result = "FAILED"
     $log.Error  = $_.Exception.Message
-    Write-Warning "Failed to update $title ($id): $($log.Error)"
+    Write-Warning ("Failed to update {0} ({1}): {2}" -f $title, $id, $_.Exception.Message)
   } finally {
     $results += New-Object psobject -Property $log
   }
 }
 
-# Always try to write CSV, even if $results is empty
+# -------- Persist CSV & render table --------
 try {
   $results | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
   Write-Host ("Audit log written to {0}" -f $CsvPath)
@@ -138,8 +193,6 @@ try {
   Write-Warning ("Failed to write CSV to {0}: {1}" -f $CsvPath, $_.Exception.Message)
 }
 
-
-# Console table
 $results |
   Select-Object TimestampUTC, IncidentId, IncidentName, IncidentNumber, Title, CreatedTimeUtc, LastModifiedTimeUtc, LastActivityTimeUtc, Severity, Owner, Result, StatusBefore, StatusAfter, Classification |
   Format-Table -AutoSize
