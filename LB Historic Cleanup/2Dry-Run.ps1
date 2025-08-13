@@ -28,7 +28,8 @@ REQUIRES:
 #>
 
 <#
-Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag, and log to CSV + TXT.
+Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag,
+and write BOTH a CSV and a TXT that contains the same comma-separated data (CSV mirror).
 - Works on Windows PowerShell 5.1 and PowerShell 7+
 - Defaults outputs to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv and .txt
 - Server-side OData filter; supports -WhatIf for dry runs
@@ -49,17 +50,16 @@ param(
 
   [Parameter(Mandatory)][string]$BaseComment,
 
-  # Optional. If omitted, defaults to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
+  # Optional. If omitted, defaults to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv (+ matching .txt)
   [string]$CsvPath
 )
 
 # -------- Defaults & validation --------
 # Default CSV path if not provided (C:\)
 if (-not $CsvPath -or [string]::IsNullOrWhiteSpace($CsvPath)) {
-  $CsvPath = Join-Path -Path 'C:\Temp\' -ChildPath ("sentinel-close-log_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+  $CsvPath = Join-Path -Path 'C:\' -ChildPath ("sentinel-close-log_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
-
-# Derive TXT path (same base name)
+# TXT mirror path (same basename, .txt extension)
 $TxtPath = [System.IO.Path]::ChangeExtension($CsvPath, '.txt')
 
 # Ensure output folder exists
@@ -101,57 +101,25 @@ function Get-Prop {
   return $null
 }
 
-# Define the output schema once so we can write header-only CSVs
+# Unified writer: exports rows to a path as CSV; if no rows, writes header-only file.
 $CsvColumns = @(
   'TimestampUTC','IncidentId','IncidentName','IncidentNumber','Title',
   'CreatedTimeUtc','LastModifiedTimeUtc','LastActivityTimeUtc','Severity','Owner',
   'Result','StatusBefore','StatusAfter','Classification','LabelsBefore','LabelsAfter','CommentSnippet','Error'
 )
 
-function Write-CsvSafe {
+function Write-TableFile {
   param([array]$Rows, [string]$Path, [string[]]$Columns)
   try {
     if ($Rows -and $Rows.Count -gt 0) {
       $Rows | Select-Object $Columns | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
     } else {
-      # Write header-only CSV so a file always exists
+      # Header-only so a file always exists
       ($Columns -join ',') | Set-Content -Path $Path -Encoding UTF8
     }
-    Write-Host ("Audit CSV written to {0}" -f $Path)
+    Write-Host ("File written to {0}" -f $Path)
   } catch {
-    Write-Warning ("Failed to write CSV to {0}: {1}" -f $Path, $_.Exception.Message)
-  }
-}
-
-function Write-TxtLog {
-  param([array]$Rows, [string]$Path, [string]$FilterText)
-  try {
-    $nowUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $lines = @()
-    $lines += "Microsoft Sentinel Incident Closure Run"
-    $lines += "RunTimestampUTC : $nowUtc"
-    $lines += "ResourceGroup   : $ResourceGroup"
-    $lines += "Workspace       : $Workspace"
-    $lines += "From            : $($fromDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-    $lines += "To              : $($toDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-    $lines += "Classification  : $Classification"
-    $lines += "Tag             : $Tag"
-    $lines += "Filter          : $FilterText"
-    $lines += "MatchedCount    : $($Rows.Count)"
-    $lines += ("-"*80)
-
-    foreach ($r in $Rows) {
-      $lines += ("Id={0} | Name={1} | Title={2} | Sev={3} | CreatedUtc={4} | Result={5}" -f `
-        $r.IncidentId, $r.IncidentName, $r.Title, $r.Severity, $r.CreatedTimeUtc, $r.Result)
-      if ($r.Error) { $lines += ("  Error: {0}" -f $r.Error) }
-    }
-    $lines += ("-"*80)
-    $lines += "End of run."
-
-    Set-Content -Path $Path -Value $lines -Encoding UTF8
-    Write-Host ("Text log written to {0}" -f $Path)
-  } catch {
-    Write-Warning ("Failed to write TXT log to {0}: {1}" -f $Path, $_.Exception.Message)
+    Write-Warning ("Failed to write file to {0}: {1}" -f $Path, $_.Exception.Message)
   }
 }
 
@@ -163,7 +131,7 @@ $results   = @()
 $incidents = Get-AzSentinelIncident -ResourceGroupName $ResourceGroup -WorkspaceName $Workspace -Filter $filter
 
 if (-not $incidents) {
-  Write-Warning "No incidents matched the filter. Continuing to write empty CSV/TXT logs."
+  Write-Warning "No incidents matched the filter. Continuing to write header-only CSV/TXT."
 }
 
 foreach ($incident in $incidents) {
@@ -182,7 +150,7 @@ foreach ($incident in $incidents) {
   $labelsBeforeRaw  = Get-Prop $p       @('Labels','labels')
   $ownerObj         = Get-Prop $p       @('Owner','owner')
 
-  # Owner normalisation
+  # Owner normalisation (try common shapes)
   $owner = $null
   if ($ownerObj) {
     $owner = Get-Prop $ownerObj @('AssignedTo','UserPrincipalName','Email','EmailAddress','Name')
@@ -250,9 +218,9 @@ foreach ($incident in $incidents) {
   }
 }
 
-# -------- Persist CSV + TXT & render table --------
-Write-CsvSafe -Rows $results -Path $CsvPath -Columns $CsvColumns
-Write-TxtLog  -Rows $results -Path $TxtPath -FilterText $filter
+# -------- Persist BOTH files (CSV + TXT mirror) & render table --------
+Write-TableFile -Rows $results -Path $CsvPath -Columns $CsvColumns
+Write-TableFile -Rows $results -Path $TxtPath -Columns $CsvColumns   # identical data, .txt extension
 
 $results |
   Select-Object TimestampUTC, IncidentId, IncidentName, IncidentNumber, Title, CreatedTimeUtc, LastModifiedTimeUtc, LastActivityTimeUtc, Severity, Owner, Result, StatusBefore, StatusAfter, Classification |
