@@ -30,39 +30,48 @@ REQUIRES:
 <#
 Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag,
 and write BOTH a CSV and a TXT (identical comma-separated data).
+
 - PowerShell 5.1 and 7+ compatible
-- Defaults CSV to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
-- TXT defaults to same basename as CSV with .txt extension, unless -TxtPath is provided
+- Defaults:
+    ResourceGroup     = "RG-REPLACE"
+    Workspace         = "WS-REPLACE"
+    From              = "2025-03-01T00:00:00Z"
+    To                = "2025-04-01T00:00:00Z"
+    Classification    = "Undetermined"
+    Tag               = "Historic"
+    BaseComment       = "Historic alerts which have been agreed with the local Bacardi team can be closed, due to no additional detections or malicious activity identified. These will be used for correlation and cross checking of any future alerts."
+    CsvPath           = C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
+    TxtPath           = <CsvPath with .txt extension>
+- Uses server-side OData filtering and supports -WhatIf dry runs
+REQUIRES: Az.Accounts, Az.OperationalInsights, Az.SecurityInsights
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-  [Parameter(Mandatory)][string]$ResourceGroup,
-  [Parameter(Mandatory)][string]$Workspace,
+  # --- Defaults you can edit below ---
+  [string]$ResourceGroup   = "RG-REPLACE",
+  [string]$Workspace       = "WS-REPLACE",
 
-  # Use ISO 8601 UTC e.g. 2025-03-01T00:00:00Z
-  [Parameter(Mandatory)][string]$From,
-  [Parameter(Mandatory)][string]$To,
+  # ISO 8601 UTC
+  [string]$From            = "2025-03-01T00:00:00Z",
+  [string]$To              = "2025-04-01T00:00:00Z",
 
-  [string]$Classification = "Undetermined",
-  [Parameter(Mandatory)][string]$Tag,
+  [string]$Classification  = "Undetermined",
+  [string]$Tag             = "Historic",
 
-  [Parameter(Mandatory)][string]$BaseComment,
+  [string]$BaseComment     = "Historic alerts which have been agreed with the local Bacardi team can be closed, due to no additional detections or malicious activity identified. These will be used for correlation and cross checking of any future alerts.",
 
-  # Optional. If omitted, defaults to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
-  [string]$CsvPath,
-
-  # Optional. If omitted, defaults to same basename as CSV with .txt extension
-  [string]$TxtPath
+  # Optional outputs (defaults applied below)
+  [string]$CsvPath         = $null,
+  [string]$TxtPath         = $null
 )
 
 # -------- Defaults & validation --------
 # Default CSV path (C:\) if not provided
 if (-not $CsvPath -or [string]::IsNullOrWhiteSpace($CsvPath)) {
-  $CsvPath = Join-Path -Path 'C:\Temp' -ChildPath ("sentinel-close-log_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+  $CsvPath = Join-Path -Path 'C:\' -ChildPath ("sentinel-close-log_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
-
-# If TxtPath not provided, mirror CSV basename with .txt
+# TXT mirrors CSV basename by default
 if (-not $TxtPath -or [string]::IsNullOrWhiteSpace($TxtPath)) {
   $TxtPath = [System.IO.Path]::ChangeExtension($CsvPath, '.txt')
 }
@@ -70,17 +79,16 @@ if (-not $TxtPath -or [string]::IsNullOrWhiteSpace($TxtPath)) {
 # Ensure CSV folder exists (handle bare filenames)
 $csvDir = Split-Path -Path $CsvPath -Parent
 if (-not $csvDir -or [string]::IsNullOrWhiteSpace($csvDir)) {
-  $csvDir = (Get-Location).Path
+  $csvDir  = (Get-Location).Path
   $CsvPath = Join-Path -Path $csvDir -ChildPath (Split-Path -Path $CsvPath -Leaf)
 }
 if (-not (Test-Path $csvDir)) {
   New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
 }
 
-# Ensure TXT folder exists (independent of CSV; supports separate drive/folder)
+# Ensure TXT folder exists (independent of CSV)
 $txtDir = Split-Path -Path $TxtPath -Parent
 if (-not $txtDir -or [string]::IsNullOrWhiteSpace($txtDir)) {
-  # If TxtPath provided without a folder, use CSV folder by default
   $TxtPath = Join-Path -Path $csvDir -ChildPath (Split-Path -Path $TxtPath -Leaf)
   $txtDir  = $csvDir
 }
@@ -138,6 +146,16 @@ function Write-TableFile {
   }
 }
 
+# -------- Detect Update-AzSentinelIncident ETag/IfMatch support --------
+$updateCmd = Get-Command Update-AzSentinelIncident -ErrorAction SilentlyContinue
+$supportsETag  = $false
+$etagParamName = $null
+if ($updateCmd) {
+  if ($updateCmd.Parameters.ContainsKey('ETag'))        { $supportsETag = $true; $etagParamName = 'ETag' }
+  elseif ($updateCmd.Parameters.ContainsKey('IfMatch')) { $supportsETag = $true; $etagParamName = 'IfMatch' }
+}
+$maxCommentLen = 1024   # conservative limit for classification comment
+
 # -------- Query & update --------
 $filter = "properties/createdTimeUtc ge $($fromDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) and properties/createdTimeUtc lt $($toDt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) and properties/status ne 'Closed'"
 Write-Verbose ("OData filter: {0}" -f $filter)
@@ -155,7 +173,7 @@ foreach ($incident in $incidents) {
 
   $id               = Get-Prop $incident @('Name','Id')
   $title            = Get-Prop $p       @('Title','title')
-  #$incidentName     = Get-Prop $p       @('IncidentName','incidentName','Name','name')
+  $incidentName     = Get-Prop $p       @('IncidentName','incidentName','Name','name')
   $incidentNumber   = Get-Prop $p       @('IncidentNumber','incidentNumber')
   $createdTimeUtc   = Get-Prop $p       @('CreatedTimeUtc','createdTimeUtc','CreatedTime','createdTime')
   $lastModifiedUtc  = Get-Prop $p       @('LastModifiedTimeUtc','lastModifiedTimeUtc')
@@ -184,14 +202,17 @@ foreach ($incident in $incidents) {
   }
   $labelsAfter = ($labelsBefore + $Tag | Where-Object { $_ } | Select-Object -Unique)
 
-  # Comment with closure timestamp (UTC)
+  # Comment with closure timestamp (UTC) and safe length
   $tsUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
   $finalComment = "$BaseComment (Closure timestamp: $tsUtc)"
+  if ($finalComment.Length -gt $maxCommentLen) {
+    $finalComment = $finalComment.Substring(0, $maxCommentLen)
+  }
 
   $log = [ordered]@{
     TimestampUTC         = $tsUtc
     IncidentId           = $id
-#    IncidentName         = $incidentName
+    IncidentName         = $incidentName
     IncidentNumber       = $incidentNumber
     Title                = $title
     CreatedTimeUtc       = $createdTimeUtc
@@ -209,47 +230,89 @@ foreach ($incident in $incidents) {
     Error                = $null
   }
 
+  # ---- Hardened update with ETag/IfMatch retry & throttling backoff ----
   try {
     $target = "Incident '$title' ($id)"
     if ($PSCmdlet.ShouldProcess($target, "Close as $Classification, add tag '$Tag'")) {
-      Update-AzSentinelIncident -ResourceGroupName $ResourceGroup -WorkspaceName $Workspace `
-        -IncidentId $id `
-        -Status "Closed" `
-        -Classification $Classification `
-        -ClassificationComment $finalComment `
-        -Labels $labelsAfter | Out-Null
+      $baseArgs = @{
+        ResourceGroupName     = $ResourceGroup
+        WorkspaceName         = $Workspace
+        IncidentId            = $id
+        Status                = 'Closed'
+        Classification        = $Classification
+        ClassificationComment = $finalComment
+        Labels                = $labelsAfter
+        ErrorAction           = 'Stop'
+      }
 
-      $log.Result = "UPDATED"
-      Start-Sleep -Milliseconds 200
+      $attempted = $false
+      try {
+        Update-AzSentinelIncident @baseArgs | Out-Null
+        $log.Result = "UPDATED"
+        $attempted = $true
+      } catch {
+        $msg = $_.Exception.Message
+        $detail = $_.ErrorDetails?.Message
+        $http  = $_.Exception.Response?.StatusCode
+        $body  = $_.Exception.Response?.Content
+        $composed = @($msg, $detail, $http, $body) -join " | "
+
+        if ($composed -match '412|Precondition|etag') {
+          if ($supportsETag -and $etagParamName) {
+            $forceArgs = $baseArgs.Clone()
+            $forceArgs[$etagParamName] = '*'
+            try {
+              Update-AzSentinelIncident @forceArgs | Out-Null
+              $log.Result = "UPDATED(ETAG-*)"
+              $attempted = $true
+            } catch {
+              $log.Result = "FAILED"
+              $log.Error  = (@($_.Exception.Message, $_.ErrorDetails?.Message, $_.Exception.Response?.StatusCode, $_.Exception.Response?.Content) -join " | ")
+            }
+          } else {
+            $log.Result = "FAILED"
+            $log.Error  = "Concurrency/ETag error but cmdlet lacks ETag/IfMatch support. Details: $composed"
+          }
+        }
+        elseif ($composed -match '403|Authorization|Forbidden|Insufficient|NotAuthorized') {
+          $log.Result = "FAILED"
+          $log.Error  = "Permission issue. Ensure Microsoft Sentinel Responder or Contributor on the workspace. Details: $composed"
+        }
+        elseif ($composed -match '429|throttle|Too Many Requests') {
+          Start-Sleep -Seconds 2
+          try {
+            Update-AzSentinelIncident @baseArgs | Out-Null
+            $log.Result = "UPDATED(RETRY)"
+            $attempted = $true
+          } catch {
+            $log.Result = "FAILED"
+            $log.Error  = (@($_.Exception.Message, $_.ErrorDetails?.Message, $_.Exception.Response?.StatusCode, $_.Exception.Response?.Content) -join " | ")
+          }
+        }
+        else {
+          $log.Result = "FAILED"
+          $log.Error  = $composed
+        }
+      }
+
+      if ($attempted -and $log.Result -like "UPDATED*") {
+        Start-Sleep -Milliseconds 200
+      }
     } else {
       $log.Result = "WHATIF"
     }
   } catch {
     $log.Result = "FAILED"
-    $log.Error  = $_.Exception.Message
-    Write-Warning ("Failed to update {0} ({1}): {2}" -f $title, $id, $_.Exception.Message)
+    $log.Error  = (@($_.Exception.Message, $_.ErrorDetails?.Message, $_.Exception.Response?.StatusCode, $_.Exception.Response?.Content) -join " | ")
+    Write-Warning ("Failed to update {0} ({1}): {2}" -f $title, $id, $log.Error)
   } finally {
     $results += New-Object psobject -Property $log
   }
 }
 
 # -------- Persist BOTH files (CSV + TXT mirror) & render table --------
-
-Write-Host ("[DEBUG] CSV path: {0}" -f $CsvPath)
-Write-Host ("[DEBUG] TXT path: {0}" -f $TxtPath)
 Write-TableFile -Rows $results -Path $CsvPath -Columns $CsvColumns
 Write-TableFile -Rows $results -Path $TxtPath -Columns $CsvColumns
-
-if (Test-Path $CsvPath) {
-    Write-Host ("[DEBUG] CSV file exists: {0}" -f $CsvPath)
-} else {
-    Write-Warning ("[DEBUG] CSV file NOT found: {0}" -f $CsvPath)
-}
-if (Test-Path $TxtPath) {
-    Write-Host ("[DEBUG] TXT file exists: {0}" -f $TxtPath)
-} else {
-    Write-Warning ("[DEBUG] TXT file NOT found: {0}" -f $TxtPath)
-}
 
 Write-Host ("CSV written to {0}" -f $CsvPath)
 Write-Host ("TXT written to {0}" -f $TxtPath)
@@ -257,3 +320,25 @@ Write-Host ("TXT written to {0}" -f $TxtPath)
 $results |
   Select-Object TimestampUTC, IncidentId, IncidentName, IncidentNumber, Title, CreatedTimeUtc, LastModifiedTimeUtc, LastActivityTimeUtc, Severity, Owner, Result, StatusBefore, StatusAfter, Classification |
   Format-Table -AutoSize
+
+# Pick the columns once
+$sel = $results |
+  Select-Object TimestampUTC, IncidentId, Title, CreatedTimeUtc, LastModifiedTimeUtc, `
+                LastActivityTimeUtc, Severity, Owner, Result, StatusBefore, StatusAfter, Classification
+
+# Timestamps & output paths (edit as needed)
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$csv   = Join-Path $PWD "incidents_$stamp.csv"
+$txt   = Join-Path $PWD "incidents_$stamp.txt"
+
+# 1) CSV (best for Excel/analysis) – don't use Format-Table for this
+$sel | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+
+# 2) Pretty text table – do format here, then write to file
+$sel |
+  Format-Table -AutoSize |
+  Out-String -Width 4096 |    # avoid truncation; use a large width
+  Set-Content -Path $txt -Encoding UTF8
+
+"$csv"
+"$txt"
