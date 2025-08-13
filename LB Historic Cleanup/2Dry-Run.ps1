@@ -234,8 +234,22 @@ foreach ($incident in $incidents) {
 }
 
 # -------- Persist BOTH files (CSV + TXT mirror) & render table --------
+
+Write-Host ("[DEBUG] CSV path: {0}" -f $CsvPath)
+Write-Host ("[DEBUG] TXT path: {0}" -f $TxtPath)
 Write-TableFile -Rows $results -Path $CsvPath -Columns $CsvColumns
 Write-TableFile -Rows $results -Path $TxtPath -Columns $CsvColumns
+
+if (Test-Path $CsvPath) {
+    Write-Host ("[DEBUG] CSV file exists: {0}" -f $CsvPath)
+} else {
+    Write-Warning ("[DEBUG] CSV file NOT found: {0}" -f $CsvPath)
+}
+if (Test-Path $TxtPath) {
+    Write-Host ("[DEBUG] TXT file exists: {0}" -f $TxtPath)
+} else {
+    Write-Warning ("[DEBUG] TXT file NOT found: {0}" -f $TxtPath)
+}
 
 Write-Host ("CSV written to {0}" -f $CsvPath)
 Write-Host ("TXT written to {0}" -f $TxtPath)
