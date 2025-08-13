@@ -29,11 +29,10 @@ REQUIRES:
 
 <#
 Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag,
-and write BOTH a CSV and a TXT that contains the same comma-separated data (CSV mirror).
-- Works on Windows PowerShell 5.1 and PowerShell 7+
-- Defaults outputs to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv and .txt
-- Server-side OData filter; supports -WhatIf for dry runs
-- Robust property handling across Az.SecurityInsights versions
+and write BOTH a CSV and a TXT (identical comma-separated data).
+- PowerShell 5.1 and 7+ compatible
+- Defaults CSV to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
+- TXT defaults to same basename as CSV with .txt extension, unless -TxtPath is provided
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
@@ -50,27 +49,43 @@ param(
 
   [Parameter(Mandatory)][string]$BaseComment,
 
-  # Optional. If omitted, defaults to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv (+ matching .txt)
-  [string]$CsvPath
+  # Optional. If omitted, defaults to C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
+  [string]$CsvPath,
+
+  # Optional. If omitted, defaults to same basename as CSV with .txt extension
+  [string]$TxtPath
 )
 
 # -------- Defaults & validation --------
-# Default CSV path if not provided (C:\)
+# Default CSV path (C:\) if not provided
 if (-not $CsvPath -or [string]::IsNullOrWhiteSpace($CsvPath)) {
-  $CsvPath = Join-Path -Path 'C:\' -ChildPath ("sentinel-close-log_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+  $CsvPath = Join-Path -Path 'C:\Temp' -ChildPath ("sentinel-close-log_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
-# TXT mirror path (same basename, .txt extension)
-$TxtPath = [System.IO.Path]::ChangeExtension($CsvPath, '.txt')
 
-# Ensure output folder exists
+# If TxtPath not provided, mirror CSV basename with .txt
+if (-not $TxtPath -or [string]::IsNullOrWhiteSpace($TxtPath)) {
+  $TxtPath = [System.IO.Path]::ChangeExtension($CsvPath, '.txt')
+}
+
+# Ensure CSV folder exists (handle bare filenames)
 $csvDir = Split-Path -Path $CsvPath -Parent
 if (-not $csvDir -or [string]::IsNullOrWhiteSpace($csvDir)) {
   $csvDir = (Get-Location).Path
   $CsvPath = Join-Path -Path $csvDir -ChildPath (Split-Path -Path $CsvPath -Leaf)
-  $TxtPath = [System.IO.Path]::ChangeExtension($CsvPath, '.txt')
 }
 if (-not (Test-Path $csvDir)) {
   New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
+}
+
+# Ensure TXT folder exists (independent of CSV; supports separate drive/folder)
+$txtDir = Split-Path -Path $TxtPath -Parent
+if (-not $txtDir -or [string]::IsNullOrWhiteSpace($txtDir)) {
+  # If TxtPath provided without a folder, use CSV folder by default
+  $TxtPath = Join-Path -Path $csvDir -ChildPath (Split-Path -Path $TxtPath -Leaf)
+  $txtDir  = $csvDir
+}
+if (-not (Test-Path $txtDir)) {
+  New-Item -ItemType Directory -Path $txtDir -Force | Out-Null
 }
 
 # Parse dates
@@ -131,7 +146,7 @@ $results   = @()
 $incidents = Get-AzSentinelIncident -ResourceGroupName $ResourceGroup -WorkspaceName $Workspace -Filter $filter
 
 if (-not $incidents) {
-  Write-Warning "No incidents matched the filter. Continuing to write header-only CSV/TXT."
+  Write-Warning "No incidents matched the filter. Writing header-only CSV/TXT."
 }
 
 foreach ($incident in $incidents) {
@@ -140,7 +155,7 @@ foreach ($incident in $incidents) {
 
   $id               = Get-Prop $incident @('Name','Id')
   $title            = Get-Prop $p       @('Title','title')
- # $incidentName     = Get-Prop $p       @('IncidentName','incidentName','Name','name')
+  #$incidentName     = Get-Prop $p       @('IncidentName','incidentName','Name','name')
   $incidentNumber   = Get-Prop $p       @('IncidentNumber','incidentNumber')
   $createdTimeUtc   = Get-Prop $p       @('CreatedTimeUtc','createdTimeUtc','CreatedTime','createdTime')
   $lastModifiedUtc  = Get-Prop $p       @('LastModifiedTimeUtc','lastModifiedTimeUtc')
@@ -176,7 +191,7 @@ foreach ($incident in $incidents) {
   $log = [ordered]@{
     TimestampUTC         = $tsUtc
     IncidentId           = $id
-    IncidentName         = $incidentName
+#    IncidentName         = $incidentName
     IncidentNumber       = $incidentNumber
     Title                = $title
     CreatedTimeUtc       = $createdTimeUtc
@@ -220,7 +235,10 @@ foreach ($incident in $incidents) {
 
 # -------- Persist BOTH files (CSV + TXT mirror) & render table --------
 Write-TableFile -Rows $results -Path $CsvPath -Columns $CsvColumns
-Write-TableFile -Rows $results -Path $TxtPath -Columns $CsvColumns   # identical data, .txt extension
+Write-TableFile -Rows $results -Path $TxtPath -Columns $CsvColumns
+
+Write-Host ("CSV written to {0}" -f $CsvPath)
+Write-Host ("TXT written to {0}" -f $TxtPath)
 
 $results |
   Select-Object TimestampUTC, IncidentId, IncidentName, IncidentNumber, Title, CreatedTimeUtc, LastModifiedTimeUtc, LastActivityTimeUtc, Severity, Owner, Result, StatusBefore, StatusAfter, Classification |
