@@ -14,13 +14,20 @@ and write BOTH a CSV and a TXT (identical comma-separated data).
     CsvPath           = C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
     TxtPath           = <CsvPath with .txt extension>
 REQUIRES: Az.Accounts, Az.OperationalInsights, Az.SecurityInsights
+
+Usage
+
+PS .\Close-Incidents-Sentinel.ps1 -Verbose -WhatIf
+
+Then remove -WhatIf to action the changes. 
+
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
   # --- Defaults you can edit below ---
-  [string]$ResourceGroup   = "RG-REPLACE",
-  [string]$Workspace       = "WS-REPLACE",
+  [string]$ResourceGroup   = "east-us-cybersecurity",
+  [string]$Workspace       = "global-cyber-security",
 
   # ISO 8601 UTC
   [string]$From            = "2025-03-01T00:00:00Z",
