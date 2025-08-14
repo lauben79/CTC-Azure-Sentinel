@@ -1,15 +1,3 @@
-<# 
-.SYNOPSIS
-Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag, and log to CSV.
-
-.EXAMPLE
-.\Close-SentinelIncidents.ps1 -ResourceGroup "<RG>" -Workspace "<Workspace>" `
-  -From "2025-03-01T00:00:00Z" -To "2025-04-01T00:00:00Z" `
-  -Tag "Historic" -BaseComment "Historic alerts which have been agreed with the local Bacardi team can be closed, due to no additional detections or malicious activity identified. These will be used for correlation and cross checking of any future alerts." -Verbose
-
-# Use -WhatIf to dry-run without making changes.
-#>
-
 <#
 Close Microsoft Sentinel incidents in a date window, classify as Undetermined, add a tag,
 and write BOTH a CSV and a TXT (identical comma-separated data).
@@ -25,15 +13,14 @@ and write BOTH a CSV and a TXT (identical comma-separated data).
     BaseComment       = "Historic alerts which have been agreed with the local Bacardi team can be closed, due to no additional detections or malicious activity identified. These will be used for correlation and cross checking of any future alerts."
     CsvPath           = C:\sentinel-close-log_yyyyMMdd_HHmmss.csv
     TxtPath           = <CsvPath with .txt extension>
-- Uses server-side OData filtering and supports -WhatIf dry runs
 REQUIRES: Az.Accounts, Az.OperationalInsights, Az.SecurityInsights
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
   # --- Defaults you can edit below ---
-  [string]$ResourceGroup   = "east-us-cybersecurity",
-  [string]$Workspace       = "global-cyber-security",
+  [string]$ResourceGroup   = "RG-REPLACE",
+  [string]$Workspace       = "WS-REPLACE",
 
   # ISO 8601 UTC
   [string]$From            = "2025-03-01T00:00:00Z",
@@ -129,13 +116,17 @@ function Write-TableFile {
   }
 }
 
-# -------- Detect Update-AzSentinelIncident ETag/IfMatch support --------
+# -------- Detect Update-AzSentinelIncident quirks (ETag + Label(s) + Description) --------
 $updateCmd = Get-Command Update-AzSentinelIncident -ErrorAction SilentlyContinue
-$supportsETag  = $false
-$etagParamName = $null
+$supportsETag  = $false; $etagParamName = $null
+$labelParam    = $null   # will be 'Labels' or 'Label' (or $null if neither)
+$supportsDesc  = $false
 if ($updateCmd) {
   if ($updateCmd.Parameters.ContainsKey('ETag'))        { $supportsETag = $true; $etagParamName = 'ETag' }
   elseif ($updateCmd.Parameters.ContainsKey('IfMatch')) { $supportsETag = $true; $etagParamName = 'IfMatch' }
+  if     ($updateCmd.Parameters.ContainsKey('Labels'))  { $labelParam = 'Labels' }
+  elseif ($updateCmd.Parameters.ContainsKey('Label'))   { $labelParam = 'Label' }
+  if     ($updateCmd.Parameters.ContainsKey('Description')) { $supportsDesc = $true }
 }
 $maxCommentLen = 1024   # conservative limit for classification comment
 
@@ -163,8 +154,14 @@ foreach ($incident in $incidents) {
   $lastActivityUtc  = Get-Prop $p       @('LastActivityTimeUtc','lastActivityTimeUtc')
   $statusBefore     = Get-Prop $p       @('Status','status')
   $severity         = Get-Prop $p       @('Severity','severity')
-  $labelsBeforeRaw  = Get-Prop $p       @('Labels','labels','Label')
+  $labelsBeforeRaw  = Get-Prop $p       @('Labels','labels')
   $ownerObj         = Get-Prop $p       @('Owner','owner')
+  $currentEtag      = Get-Prop $incident @('Etag','etag','Properties.Etag','properties.etag')
+  $description      = Get-Prop $p       @('Description','description','IncidentDescription','incidentDescription')
+
+  # Safe fallbacks (avoid empty required fields)
+  if (-not $title -or [string]::IsNullOrWhiteSpace($title)) { $title = ("Incident {0}" -f $id) }
+  if (-not $severity -or [string]::IsNullOrWhiteSpace($severity)) { $severity = 'Low' }
 
   # Owner normalisation (try common shapes)
   $owner = $null
@@ -213,11 +210,11 @@ foreach ($incident in $incidents) {
     Error                = $null
   }
 
-  # ---- Hardened update with ETag/IfMatch retry & throttling backoff (no ?. operators) ----
   try {
     $target = "Incident '$title' ($id)"
     if ($PSCmdlet.ShouldProcess($target, "Close as $Classification, add tag '$Tag'")) {
 
+      # Build base args (include Title/Severity; add Description if supported)
       $baseArgs = @{
         ResourceGroupName     = $ResourceGroup
         WorkspaceName         = $Workspace
@@ -225,8 +222,19 @@ foreach ($incident in $incidents) {
         Status                = 'Closed'
         Classification        = $Classification
         ClassificationComment = $finalComment
-        Labels                = $labelsAfter
+        Title                 = $title
+        Severity              = $severity
         ErrorAction           = 'Stop'
+      }
+      if ($supportsDesc -and $description) { $baseArgs['Description'] = $description }
+
+      # Pick the correct label parameter and shape
+      if     ($labelParam -eq 'Labels') { $baseArgs['Labels'] = $labelsAfter } # string[]
+      elseif ($labelParam -eq 'Label')  { $baseArgs['Label']  = ($labelsAfter | ForEach-Object { @{ Name = $_ } }) } # IIncidentLabel[]
+
+      # If the cmdlet supports If-Match/ETag and we have an ETag, send it on the first go
+      if ($supportsETag -and $etagParamName -and $currentEtag) {
+        $baseArgs[$etagParamName] = $currentEtag
       }
 
       $attempted = $false
@@ -235,14 +243,10 @@ foreach ($incident in $incidents) {
         $log.Result = "UPDATED"
         $attempted = $true
       } catch {
-        # Safe error extraction for PS 5.1
+        # Extract errors safely (PS 5.1)
         $msg    = $_.Exception.Message
-        $detail = $null
-        $http   = $null
-        $body   = $null
-        if ($_.ErrorDetails) {
-          try { if ($_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message } } catch {}
-        }
+        $detail = $null; if ($_.ErrorDetails) { try { if ($_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message } } catch {} }
+        $http   = $null; $body = $null
         if ($_.Exception -and $_.Exception.Response) {
           try { $http = $_.Exception.Response.StatusCode } catch {}
           try { $body = $_.Exception.Response.Content } catch {}
@@ -302,7 +306,7 @@ foreach ($incident in $incidents) {
       }
 
       if ($attempted -and $log.Result -like "UPDATED*") {
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 200  # pacing
       }
     } else {
       $log.Result = "WHATIF"
@@ -325,8 +329,8 @@ foreach ($incident in $incidents) {
 }
 
 # -------- Persist BOTH files (CSV + TXT mirror) & render table --------
-Write-TableFile -Rows $results -Path $CsvPath -Columns $CsvColumns
-Write-TableFile -Rows $results -Path $TxtPath -Columns $CsvColumns
+function Write-TableMirror { param([array]$Rows,[string]$Csv,[string]$Txt,[string[]]$Cols) Write-TableFile -Rows $Rows -Path $Csv -Columns $Cols; Write-TableFile -Rows $Rows -Path $Txt -Columns $Cols }
+Write-TableMirror -Rows $results -Csv $CsvPath -Txt $TxtPath -Cols $CsvColumns
 
 Write-Host ("CSV written to {0}" -f $CsvPath)
 Write-Host ("TXT written to {0}" -f $TxtPath)
@@ -335,7 +339,7 @@ $results |
   Select-Object TimestampUTC, IncidentId, IncidentName, IncidentNumber, Title, CreatedTimeUtc, LastModifiedTimeUtc, LastActivityTimeUtc, Severity, Owner, Result, StatusBefore, StatusAfter, Classification |
   Format-Table -AutoSize
 
-# Pick the columns once
+  # Pick the columns once
 $sel = $results |
   Select-Object TimestampUTC, IncidentId, Title, CreatedTimeUtc, LastModifiedTimeUtc, `
                 LastActivityTimeUtc, Severity, Owner, Result, StatusBefore, StatusAfter, Classification
